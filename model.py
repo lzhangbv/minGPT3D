@@ -40,6 +40,8 @@ class ParallelAttention(nn.Module):
     def forward(self, x):
         B, T, _ = x.size() # batch size, sequence length
 
+        # an identity operator in the forward pass (all-reduce in the backward pass)
+        x = utils.copy_to_tensor_parallel_region(x)
         # calculate query, key, values
         q, k ,v  = self.c_attn(x).split(self.n_local_embd, dim=2)
         k = k.view(B, T, self.n_local_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
@@ -53,11 +55,10 @@ class ParallelAttention(nn.Module):
         y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_local_embd)
 
-        # output projection, followed by an all-reduce layer
+        # output projection, followed by an all-reduce in the forward pass (identity in the backward pass)
         y = self.c_proj(y)
-        if tp_size > 1:
-            y_sum = torch.distributed.nn.all_reduce(y, group=todo) # with backward's allreduce
-        return y_sum
+        y = utils.reduce_from_tensor_parallel_region(y)
+        return y
 
 class ParallelMLP(nn.Module):
     """MLP layer with Tensor Parallelism. """
@@ -69,10 +70,10 @@ class ParallelMLP(nn.Module):
         self.act = torch.nn.GELU(approximate='tanh') # GeLU activation function
 
     def forward(self, x):
+        x = utils.copy_to_tensor_parallel_region(x)
         y = self.c_proj(self.act(self.c_fc(x)))
-        if tp_size > 1:
-            y_sum = torch.distributed.nn.all_reduce(y, group=todo) # with backward's allreduce
-        return y_sum
+        y = utils.reduce_from_tensor_parallel_region(y)
+        return y
 
 class TransformerBlock(nn.Module):
     """Transformer block with Tensor Parallelism. """
@@ -108,13 +109,13 @@ class PipelineStage(nn.module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd)
             ))
-            # broadcast embedding weights (TP), todo
+            # broadcast embedding weights (across TP), todo
         if self.is_last_pipeline_stage:
             self.output_layers = nn.ModuleDict(dict(
                 post_ln = nn.LayerNorm(config.n_embd), 
                 lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
             ))
-            # broadcast output head weight (TP), todo
+            # broadcast output head weight (across TP), todo
         self.transformer_layers = torch.nn.ModuleList([TransformerBlock(config) for _ in range(self.n_local_layer)])
 
     def forward_step(self, idx, targets):
